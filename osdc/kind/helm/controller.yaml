@@ -1,0 +1,24 @@
+replicaCount: 1
+image:
+  repository: mirror.aone.alibaba-inc.com/mirrors/ghcr.io/jeanschmidt/gha-runner-scale-set-controller
+  tag: "0.14.1-jeanschmidt.20"
+fullnameOverride: arc-controller
+serviceAccount:
+  name: arc-controller
+metrics:
+  controllerManagerAddr: ":8080"
+  listenerAddr: ":8080"
+  listenerEndpoint: "/metrics"
+nodeSelector:
+  role: base-infrastructure
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi

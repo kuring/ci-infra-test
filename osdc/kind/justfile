@@ -1,0 +1,107 @@
+# Local-only kind operations. This file is not part of ci-infra CI.
+import 'slow-tests/recipes.just'
+
+set working-directory := "."
+set shell := ["bash", "-euo", "pipefail", "-c"]
+LOCAL := justfile_directory()
+OSDC := env_var_or_default("OSDC_UPSTREAM", LOCAL / "../../../ci-infra/osdc")
+STATE := LOCAL / ".state"
+export OSDC_UPSTREAM := OSDC
+export UV_PROJECT := OSDC
+export UV_PROJECT_ENVIRONMENT := env_var_or_default("UV_PROJECT_ENVIRONMENT", STATE / "venv")
+export UV_CACHE_DIR := env_var_or_default("UV_CACHE_DIR", STATE / "uv-cache")
+export PYTHONDONTWRITEBYTECODE := "1"
+
+# Create the isolated local cluster for real ARC fork validation.
+kind-drain-create:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    mkdir -p "{{STATE}}"
+    # kind forwards these variables to nodes; loopback would point at each node.
+    NODE_PROXY="http://host.docker.internal:13660"
+    if [[ "${OSDC_KIND_DIRECT_NETWORK:-false}" == "true" ]]; then NODE_PROXY=""; fi
+    NODE_NO_PROXY="${NO_PROXY:-},${no_proxy:-},localhost,127.0.0.1,host.docker.internal,.alibaba-inc.com,.aliyun-inc.com"
+    HTTP_PROXY="$NODE_PROXY" HTTPS_PROXY="$NODE_PROXY" \
+      http_proxy="$NODE_PROXY" https_proxy="$NODE_PROXY" \
+      NO_PROXY="$NODE_NO_PROXY" no_proxy="$NODE_NO_PROXY" \
+      kind create cluster --name osdc-drain-local \
+      --config "{{LOCAL}}/kubernetes/kind.yaml" \
+      --kubeconfig "{{STATE}}/kubeconfig" --wait 180s
+
+# Read-only guard. All local mutations use this isolated kubeconfig/context.
+kind-drain-guard:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    KUBE="{{STATE}}/kubeconfig"
+    CONTEXT=$(kubectl --kubeconfig "$KUBE" config current-context)
+    echo "guard: kubeconfig=$KUBE"
+    echo "guard: context=$CONTEXT"
+    [[ "$CONTEXT" == "kind-osdc-drain-local" ]] || { echo "Not the owned kind context" >&2; exit 1; }
+    kubectl --kubeconfig "$KUBE" --context kind-osdc-drain-local get nodes -o json \
+        | uv run python -c 'import json,sys; nodes=json.load(sys.stdin)["items"]; expected={"osdc-drain-local-control-plane", "osdc-drain-local-worker"}; names=sorted(n["metadata"]["name"] for n in nodes); ok=set(names)==expected and all(n["metadata"].get("labels",{}).get("osdc.io/drain-kind")=="true" for n in nodes); print("guard: nodes ok: " + ", ".join(names)) if ok else print("Unexpected kind nodes or ownership labels: " + ", ".join(names), file=sys.stderr); sys.exit(0 if ok else 1)'
+
+# Foreground local HTTP-to-SOCKS5 relay. Ctrl-C stops it; no system proxy changes.
+kind-drain-proxy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    uvx --python 3.12 --from pproxy==2.7.9 pproxy \
+        -l http://127.0.0.1:13660 -r socks5://127.0.0.1:13659
+
+# Install the same ARC fork version as OSDC, without GitHub credentials.
+kind-drain-controller:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    just --justfile "{{LOCAL}}/justfile" kind-drain-guard
+    CHART="{{STATE}}/charts/gha-runner-scale-set-controller"
+    if [[ ! -f "$CHART/Chart.yaml" ]]; then
+        helm pull oci://ghcr.io/jeanschmidt/actions-runner-controller-charts/gha-runner-scale-set-controller \
+            --version 0.14.1-jeanschmidt.20 --untar --untardir "{{STATE}}/charts"
+    fi
+    IMAGE_ARGS=()
+    if [[ "${OSDC_KIND_ARC_PUBLIC_IMAGES:-false}" == "true" ]]; then
+        IMAGE_ARGS+=(--set image.repository=ghcr.io/jeanschmidt/gha-runner-scale-set-controller)
+    fi
+    helm upgrade --install arc "$CHART" "${IMAGE_ARGS[@]}" \
+        --kubeconfig "{{STATE}}/kubeconfig" --kube-context kind-osdc-drain-local \
+        --namespace arc-systems --create-namespace \
+        -f "{{LOCAL}}/helm/controller.yaml" --wait --timeout 5m
+
+# Recreate only the owned local scale set's listener.
+kind-drain-restart-listener:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    just --justfile "{{LOCAL}}/justfile" kind-drain-guard
+    kubectl --kubeconfig "{{STATE}}/kubeconfig" --context kind-osdc-drain-local \
+        delete autoscalinglisteners -n arc-systems -l actions.github.com/scale-set-name=osdc-kind-drain
+
+# Re-register only the owned local runner release; do not use during a test.
+kind-drain-reset:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    just --justfile "{{LOCAL}}/justfile" kind-drain-guard
+    helm uninstall osdc-kind-drain --namespace arc-runners \
+        --kubeconfig "{{STATE}}/kubeconfig" --kube-context kind-osdc-drain-local \
+        --wait --timeout 180s
+    kubectl --kubeconfig "{{STATE}}/kubeconfig" --context kind-osdc-drain-local \
+        wait --for=delete autoscalingrunnerset/osdc-kind-drain -n arc-runners --timeout=180s
+    just --justfile "{{LOCAL}}/justfile" kind-drain install
+
+# Local kind profile: render/install/test/restore/probe. Never targets AWS staging.
+kind-drain action="test" *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    uv run --frozen "{{LOCAL}}/scripts/python/drain_test_kind.py" "{{action}}" {{args}}
+
+# Offline upstream + local regression tests; no Kubernetes or GitHub access.
+kind-drain-unit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    uv run --frozen pytest -p no:cacheprovider "{{OSDC}}/integration-tests/drain-test/scripts/python" "{{LOCAL}}/scripts/python" -q
