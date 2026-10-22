@@ -105,3 +105,40 @@ kind-drain-unit:
     set -euo pipefail
     source "{{OSDC}}/scripts/mise-activate.sh"
     uv run --frozen pytest -p no:cacheprovider "{{OSDC}}/integration-tests/drain-test/scripts/python" "{{LOCAL}}/scripts/python" -q
+
+# Real Linux process recovery + durable API substitutes. macOS uses Docker.
+kind-drain-recovery-unit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        uv run --frozen pytest -p no:cacheprovider -o addopts='' "{{LOCAL}}/tests/integration" -v
+    else
+        docker build -t ci-infra-test-drain-recovery -f "{{LOCAL}}/docker/recovery.Dockerfile" "{{OSDC}}"
+        docker run --rm --init --network none \
+            -e OSDC_UPSTREAM=/upstream \
+            -v "{{OSDC}}:/upstream:ro" \
+            -v "{{LOCAL}}/tests/integration:/suite:ro" \
+            ci-infra-test-drain-recovery python -m pytest -p no:cacheprovider -o addopts='' /suite -v
+    fi
+
+# Opt-in: signals a real controller, restores in a fresh process, reclaims GitHub leftovers.
+kind-drain-recovery *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    uv run --frozen "{{LOCAL}}/scripts/python/drain_recovery_kind.py" {{args}}
+
+# Real GitHub server cancellation; temporary native runners outside the drained ARC set.
+kind-drain-service-cancel *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    uv run --frozen "{{LOCAL}}/scripts/python/drain_service_cancel.py" {{args}}
+
+# Internal entrypoint for the generated service-cancellation workflow.
+kind-drain-service-step action *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    uv run --frozen "{{LOCAL}}/scripts/python/drain_service_cancel.py" --worker "{{action}}" {{args}}

@@ -123,6 +123,59 @@ capacity 同时归零；三个 held 任务在 60 秒观察期间保持 queued �
 resume 后三个 held 全部成功，runner group 正确，资源恢复并清理成功。退出码必须为 0。
 本地预览、离线单测或容量 probe 通过，都不代表真实 E2E 通过。
 
+### CI 取消恢复与固定分支残留回收
+
+```bash
+# Linux 原生运行；macOS 自动用 Docker，运行容器禁用网络且不挂载 PAT
+just kind-drain-recovery-unit
+
+# Linux 上的真实 Kind + GitHub 验收，需要上述集群、ARC 和专用 PAT
+just kind-drain-recovery --output "$PWD/.state/recovery-acceptance"
+```
+
+第一条运行六项集成回归：SIGINT、SIGTERM、忽略 TERM 后强制回收、父进程退出后
+SIGKILL 留下的孤儿子进程，以及有 PR / 无 PR 两种固定分支残留。使用真实 Linux
+`/proc`、进程组、信号、恢复文件和独立恢复进程；GitHub 与集群状态由持久化测试替身提供。
+Docker 镜像从上游 `pyproject.toml` / `uv.lock` 安装锁定依赖，构建时需要网络。
+
+第二条复用当前上游控制器、drain/resume recipes 与工作流模板，运行三种真实场景：
+
+- SIGTERM 取消处于 drained 状态的控制器，核对没有 inline resume，然后由新进程恢复。
+- SIGKILL 控制器并保留带 ownership token 的真实 recipe 进程，由新进程通过 `/proc`
+  找到并停止它，再恢复完整 limits map 与正 advertised capacity，持续复查容量未被写回零。
+- 下一进程回收专用固定分支上的旧 PR、原始/唤醒运行和分支，并成功创建新 canary；
+  另测“有分支、无 PR”的中断残留。整个过程保留相似名称的对照分支并核对其内容未变。
+
+专用固定分支为 `codex/osdc-drain-recovery-kind`；只在 `kuring/ci-infra` 创建临时资源，
+不修改 main。入口使用独立文件锁；请勿同时运行其他 drain/probe/install/reset 操作。
+启动时若该固定分支或对照分支已存在，会拒绝执行，需先检查此前运行的证据和残留。
+输出目录必须不存在；每阶段保存进程日志、恢复文件、PR/run ID、容量快照及结果 JSON。
+异常路径先停止 writer 并恢复容量，再清理 GitHub 资源；恢复失败会保留证据并返回非零。
+
+这是 runner 发信号后的进程交接验证，不验证 GitHub Actions 服务端取消调度、并发锁释放，
+也不替代 AWS staging 验收。取消场景故意中止原任务，不把它们记为正常 drain E2E success。
+
+### GitHub Actions 服务端取消整个 job
+
+```bash
+# 在同一专用 Linux x64 Kind 主机执行；目录必须不存在
+just kind-drain-service-cancel --output "$PWD/.state/service-cancel-acceptance"
+```
+
+该入口注册两个带唯一专用标签的临时 native runner，均在被 drain 的 ARC scale set 之外。
+从 GitHub 官方 API 获取 runner 包并校验 SHA-256。临时工作流沿用当前上游 drain job 的
+取消条件、drain/restore step 条件、超时及 `cancel-in-progress: false`；AWS 连接步骤改为
+专用 Kind guard，并使用独立测试 concurrency group，不占用 staging 的锁。
+
+第一个 runner 执行真实 drain；第二个 runner 保持可用，后续 job 排队等待同一把锁。
+达到 drained 状态后通过普通 GitHub workflow cancel API 取消原运行，检查 drain step
+被取消、同 job 的 `always()` restore step 成功、实际容量恢复，并确认恢复步骤结束前
+后续 job 未启动。恢复完成后保留 30 秒观察窗口，用于验证锁仍由原 job 持有。
+
+输出保存实际 job/step 结果、调度时间线和恢复前后的容量。外部 fallback 仅清场，不能
+让失败的服务端恢复验收变为通过。结束时注销两个 runner、删除其本地认证文件，并回收
+临时 PR、分支、运行和 probe Pod。不验证 GitHub-hosted runner 平台或 AWS staging。
+
 上游 slow-tests 会等待 load、compactor、janitor 结束才运行 drain-test。
 本地 `kind-slow-test` 是另一个集群（`osdc-slow-local`）的 load/compactor/janitor 测试入口，
 没有自动包含 `kind-drain`；本次目标使用上面独立的 drain 环境与命令。
