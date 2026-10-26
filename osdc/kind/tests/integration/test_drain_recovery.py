@@ -61,6 +61,7 @@ def test_cancel_then_independent_restore(tmp_path, sig, mode):
             assert alive(writer_pid)
             recovery = json.loads((tmp_path / "recovery.json").read_text())
             assert recovery["token"]
+            assert recovery["cluster"] == "meta-staging-aws-uw1"
             controller.send_signal(sig)
             assert controller.wait(timeout=15) == (-sig if sig == signal.SIGKILL else 128 + sig)
             assert json.loads((tmp_path / "limits.json").read_text())["cpu"] == 0

@@ -38,6 +38,7 @@ from drain_test_run import (  # noqa: E402
     run_controller,
     wait_for,
 )
+from runner_constants import REFRESH_TAINT_EFFECT, REFRESH_TAINT_KEY, REFRESH_TAINT_VALUE  # noqa: E402
 
 ROOT = LOCAL / ".state"
 LOCAL_CLUSTER = "kind-local"
@@ -47,12 +48,20 @@ LABEL = "osdc-kind-drain"
 VERSION = "0.14.1-jeanschmidt.20"
 
 
+def refresh_tolerations():
+    # Kind has no node provisioner; keep the shared taint assertions while
+    # allowing local probes to use its single, surviving worker.
+    return [
+        {"key": REFRESH_TAINT_KEY, "operator": "Equal", "value": REFRESH_TAINT_VALUE, "effect": REFRESH_TAINT_EFFECT}
+    ]
+
+
 def generate_kind_workflow(key):
     # Adapt shared group targeting locally to the repository-scoped scale set.
     return re.sub(
         r"(?m)^    runs-on:\n(?:      .*\n)+",
         f"    runs-on: {LABEL}\n",
-        generate_workflow(key),
+        generate_workflow(key, LABEL, "default"),
     )
 
 
@@ -131,6 +140,7 @@ def runner_values() -> dict:
         "template": {
             "spec": {
                 "nodeSelector": {"node-fleet": "kind-local"},
+                "tolerations": refresh_tolerations(),
                 "containers": [
                     {
                         "name": "runner",
@@ -244,6 +254,7 @@ def install() -> None:
         "kind": "Pod",
         "spec": {
             "nodeSelector": {"node-fleet": "kind-local"},
+            "tolerations": refresh_tolerations(),
             "containers": [
                 {
                     "name": "$job",
@@ -321,9 +332,14 @@ def install() -> None:
 
 class KindDrainTest(DrainTest):
     def __init__(self, args, key):
+        # The shared controller now requires the selected cluster during base
+        # initialization.  Keep that staging-facing CLI detail inside this
+        # local adapter and always bind it to the owned Kind cluster.
+        args.cluster_id = LOCAL_CLUSTER
         super().__init__(args, key)
         self.cluster = LOCAL_CLUSTER
         self.group = "default"
+        self.probe_label = LABEL
         self.repository = REPOSITORY
         self.branch = f"codex/osdc-drain-test-kind-{key}"
         self.env.update(

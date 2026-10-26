@@ -30,6 +30,8 @@ def event(root, name, **data):
 
 class FixtureDrain(DrainTest):
     def prepare(self):
+        self.group = "meta-staging-aws-uw1"
+        self.probe_label = "c-mt-l-x86iamx-8-16"
         self.desired = {"cpu": 3, "excluded": 0}
 
     def resume(self):
@@ -121,6 +123,7 @@ def main():
         writer(root, extra[0])
         return
     args = argparse.Namespace(
+        cluster_id="meta-staging-aws-uw1",
         root_dir=root,
         upstream_dir=UPSTREAM,
         clusters_yaml=root / "clusters.yaml",
@@ -133,6 +136,7 @@ def main():
     )
     test = FixtureDrain(args, "integration")
     if action == "reclaim":
+        test.prepare()
         test.cleanup_stale_canary()
         test.create_pr()
         event(root, "recreated", branch=test.branch, pr=test.pr)

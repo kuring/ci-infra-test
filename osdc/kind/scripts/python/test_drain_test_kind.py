@@ -87,6 +87,7 @@ def test_render_keeps_real_recipes_and_changes_only_connection(local):
     assert values["runnerGroup"] == "default"
     assert "github_pat_" not in (local / "runner-values.yaml").read_text()
     assert values["containerMode"]["type"] == "kubernetes-novolume"
+    assert values["template"]["spec"]["tolerations"] == module.refresh_tolerations()
     env = {e["name"]: e["value"] for e in values["listenerTemplate"]["spec"]["containers"][0]["env"]}
     assert env["CAPACITY_AWARE_ENABLED"] == "true"
     assert env["CAPACITY_AWARE_PROACTIVE_CAPACITY"] == "3"
@@ -110,6 +111,8 @@ def test_install_sends_secret_via_stdin_and_checks_version(local, monkeypatch):
     secret = json.loads(kube.call_args_list[1].kwargs["input"])
     assert base64.b64decode(secret["data"]["github_token"]).decode() == "github_pat_fixture"
     assert all("github_pat_" not in str(c.args) for c in kube.call_args_list)
+    job_template = json.loads(kube.call_args_list[2].kwargs["input"])
+    assert yaml.safe_load(job_template["data"]["pod.yaml"])["spec"]["tolerations"] == module.refresh_tolerations()
     assert cmd.call_args.args[0][:3] == ["helm", "upgrade", "--install"]
     assert module.CONTEXT in cmd.call_args.args[0]
     (chart / "Chart.yaml").write_text("version: wrong\n")
@@ -190,14 +193,14 @@ def test_kind_controller_reuses_shared_logic_with_local_identity(local, monkeypa
 
 
 def test_kind_workflow_preserves_shared_probes_and_pull_request_trigger():
-    expected = yaml.safe_load(module.generate_workflow("abc123"))
+    expected = yaml.safe_load(module.generate_workflow("abc123", module.LABEL, "default"))
     for job in expected["jobs"].values():
         job["runs-on"] = module.LABEL
 
     content = module.generate_kind_workflow("abc123")
     assert yaml.safe_load(content) == expected
     # YAML 1.1 treats `on` as a boolean; ensure it remains an Actions event key.
-    assert "\non:\n" in content
+    assert "\non:\n" in content or '\n"on":\n' in content
 
 
 @pytest.mark.parametrize("action", ["render", "install", "test", "restore", "probe", "dry-run"])

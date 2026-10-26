@@ -105,6 +105,11 @@ kubectl -n arc-runners get autoscalingrunnersets,pods
 
 ## 运行与验收
 
+Kind 没有节点自动供给能力。本地 runner 和 workflow Pod 显式容忍
+`deploy.osdc.io/refresh-pending=true:NoSchedule`，以便在唯一 worker 保留
+refresh taint 时完成任务恢复；控制器仍验证 taint 保留及按所有权清理。
+这项本地适配不覆盖 refresh taint 阻止新任务调度、节点替换或 Karpenter 供给行为。
+
 同一集群一次只运行一个测试，期间不要 install、reset 或重启 listener。
 
 ```bash
