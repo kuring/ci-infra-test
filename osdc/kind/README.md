@@ -1,7 +1,9 @@
 # 在独立 Kind 环境验证 ci-infra drain-test
 
 本目录属于 `ci-infra-test`，用于适配 `ci-infra` 的本地验证环境。上游代码保持不变。
-当前对照版本为 `ci-infra` 的 `e7dbd06e`
+最新复验：547 项回归、Linux 恢复 6/6 和容量 probe 通过；普通 E2E 在恢复 held 时超时，
+真实取消恢复在启动阶段超时。完整证据与未覆盖范围见[当前验证记录](docs/current-validation.md)。
+当前对照版本为 `ci-infra` 的 `a09b8a5`
 （`test: add verified OSDC drain and undrain slow test`）。
 
 `kind-drain` 直接导入上游 `DrainTest`、`run_controller`、断言和工作流模板，
@@ -221,7 +223,7 @@ just kind-drain-service-cancel --output "$PWD/.state/service-cancel-acceptance"
 just kind-drain restore
 ```
 
-## 验证状态与已知限制（2026-10-21）
+## 历史验证状态与已知限制（2026-10-21）
 
 本次已修复迁移后路径失效、旧工作流模块导入、consumer 配置路径和独立 slow-tests
 入口的路径假设，并加入实际执行上游配置解析脚本的回归测试。
@@ -230,7 +232,7 @@ just kind-drain restore
 任务，仅在启动及 resume 后、目标容量为正时提交有界的新任务流量唤醒旧队列。
 每阶段最多 8 次，间隔至少 15 秒；drain 观察窗口和恢复清理不发送唤醒。
 
-最新一次远程全链路复验已通过：ECS 全量 `just test`、213 项相关单测、ARC 部署、容量
+2026-10-21 当次远程全链路复验已通过：ECS 全量 `just test`、213 项相关单测、ARC 部署、容量
 probe 与真实 drain E2E 均成功；启动用了 3 次唤醒，resume 后用了 2 次，四个原任务均
 success、job ID 不变。原始 [workflow 39584402848](https://github.com/kuring/ci-infra/actions/runs/39584402848)
 成功，脚本退出 0，配置与容量恢复正常，临时 GitHub 资源已清理。

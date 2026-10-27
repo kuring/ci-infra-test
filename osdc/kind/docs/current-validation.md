@@ -1,3 +1,92 @@
+# drain-test 当前源码复验（2026-10-27 21:57—22:32）
+
+**普通 E2E 未通过：resume 后三个 held 在 600 秒内没有完成；真实取消恢复在启动阶段超时。**
+本轮在 ECS `i-t4ne3fqx0h2huvw840vm` 的专用 `kind-osdc-drain-local` 执行，
+通过 `workbench connect --instance-id i-t4ne3fqx0h2huvw840vm` 连接。
+
+上游固定为 `a09b8a5f295c0ceb48de3a0859d86ef795ea8824`；本地核对全部上游快照文件
+与该提交一致。适配器基于 `dbeaf36`，包含本轮 `f47c140` 的取消信号透传修复。
+结束审计确认 989 个源码文件没有漂移。没有修改上游代码、升级版本或重建集群。
+
+## 结果
+
+| 检查 | 结果 |
+| --- | --- |
+| 上游 drain + Kind 适配单测 | 547 项通过，无跳过 |
+| Linux 原生进程恢复集成，使用持久化 API 替身 | 6/6 通过 |
+| dry-run、专用集群 guard、同版本 runner install | 全部退出 0 |
+| 实际容量 probe | 退出 0，limits 与 advertised capacity 完成 3 → 0 → 3 |
+| 上游全量 `just test` | 退出 0，`OK (1m4s)` |
+| 上游全量 `just lint` | 13/14 通过；已有 runner-base Dockerfile:36 的 Hadolint DL3066 失败 |
+| 修改文件 Ruff E/F/I（120 列）及 diff 检查 | 通过 |
+| 默认 E2E | 退出 1；inflight 成功，held 在 resume 后超时 |
+| 真实取消恢复 | 退出 1；首个 SIGTERM 场景的 inflight 启动超时，未到达 drain 检查点，未发送信号 |
+| SIGKILL、固定分支恢复后续场景、GitHub 服务端取消验收 | 因首个真实恢复场景失败，本轮未执行 |
+| 最终审计 | 通过，容量恢复、资源清理及源码一致性检查通过 |
+
+## 默认 E2E 时间线
+
+PR [91](https://github.com/kuring/ci-infra/pull/91)，原始
+[run 40517069823](https://github.com/kuring/ci-infra/actions/runs/40517069823)。
+执行 `just kind-drain test --start-timeout 600 --finish-timeout 600 --drain-timeout 300`。
+本轮没有开启 `--startup-wakeup`，没有额外手工提交启动或恢复流量。
+
+| 北京时间 | 结果 |
+| --- | --- |
+| 22:00:29 | 找到原始 run，等待 inflight |
+| 22:06:47 | 原始 inflight 进入等待步骤，开始 drain |
+| 22:06:58 | limits 与 advertised capacity 同时归零 |
+| 22:09:17 | GitHub API 确认 inflight success，drain 进程组回收 |
+| 22:09:18—22:10:18 | 三个原始 held 在完整 60 秒窗口保持 queued，容量维持零 |
+| 22:10:18—22:10:19 | 旧 worker 加 refresh taint，启用预留 worker，恢复 limits，旧 UID 与 taint 检查通过 |
+| 22:10:31 | 上游发送一次内置 held wakeup |
+| 22:20:19 | held 完成预算耗尽，随后控制器清理并退出 1 |
+
+原始 inflight job `122233470511` 成功；三个原始 held job
+`122236865557`、`122236865587`、`122236865865` 在结束前保持 queued、runner_id=0，
+没有被重跑或替换，因此没有获得 held 在非旧节点放置成功的验收证据。
+
+超时发生于 `held jobs succeed after undrain`；异常中保留的最后错误为
+`Waiting for positive advertised capacity on osdc-kind-drain`。
+恢复中途 listener 日志持续报告 `reportedCapacity=3`、`queuedJobs=0`；
+普通 E2E 结束后的独立审计也确认 advertised capacity=3。
+这些证据不足以把整个等待窗口解释为容量持续归零，也不足以确定任务分配问题的根因。
+
+## 真实取消恢复与适配修复
+
+PR [92](https://github.com/kuring/ci-infra/pull/92)，原始
+[run 40520349941](https://github.com/kuring/ci-infra/actions/runs/40520349941)。
+`just kind-drain-recovery --output ...` 的首个 SIGTERM 场景在 600 秒启动预算内
+没有等到 inflight 执行，控制器在 drain 前退出 1，父进程随后清理。
+本轮没有完成信号注入、独立进程恢复或服务端取消验收；离线 6/6 不能替代这些真实验收。
+
+准备阶段首次快照遗漏仓库根目录工作流，补齐后重新执行了单测和全量测试。
+首次实际 probe 另发现新版上游传入 `cancel_event`，而 Kind 控制器覆盖方法未接收该参数。
+修复仅位于 `ci-infra-test`：透传取消信号和 deadline 到 kubectl，并增加回归测试；
+对应提交 `f47c140` 已推送。原始准备失败及修复前日志保留在证据归档中。
+
+## 最终状态与证据
+
+两个 PR 均关闭，精确测试分支与 sentinel 分支均不存在；本轮三个 workflow run
+（普通原始 run、内置 wakeup run `40518614106`、恢复原始 run）均 completed/cancelled。
+最终 maxRunners=3、advertised capacity=3，没有实际 runner/workflow Pod、遗留 writer
+或后台测试/采样进程。
+普通 E2E 的旧 taint 保留状态已单独保存于 `e2e-boundary-audit.json`；
+随后恢复场景的准备阶段重置 worker，最终预留 worker 回到 `kind-reserve`。
+
+远端证据：`/root/drain-current-20261027/evidence/`。
+本地下载并校验至 `.state/retest-20261027-current/evidence/`。
+归档不含 PAT、环境凭证或 native runner 认证文件。
+
+```text
+evidence.tar.gz
+SHA-256: a612c18c897b3635f4d8e2ec41f6f50d63817d61845a8a523f165b9ec5402c40
+```
+
+本轮为专用 Kind 验证，不覆盖 AWS staging、Karpenter 自动供给或实际节点替换。
+
+---
+
 # drain-test 完整复验（2026-10-27 20:39）
 
 **默认 E2E 再次在启动阶段超时；额外流量对照、真实取消恢复和服务端取消验收均通过。**
