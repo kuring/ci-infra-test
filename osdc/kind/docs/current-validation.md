@@ -1,4 +1,121 @@
-# drain-test 当前验证（2026-10-27）
+# drain-test 完整复验（2026-10-27 20:39）
+
+**默认 E2E 再次在启动阶段超时；额外流量对照、真实取消恢复和服务端取消验收均通过。**
+本轮固定 `ci-infra` 的 `e7dbd06e848cc8c9d9aa88f87c92371b845c31c3` 与
+`ci-infra-test` 的 `dbeaf36ee87e0a6721731f2e950d5579e0f4f720`，
+668 个源码文件的哈希在结束审计中全部一致。没有修改测试代码或上游代码。
+
+执行结束检查时，本地 ci-infra 已出现后续提交 `10764654` 和两个未提交 Python 修改；
+**本轮结论不覆盖这些后续变化**。执行主机仍为 ECS `i-t4ne3fqx0h2huvw840vm`，
+使用现有专用双 worker Kind 集群，没有重建集群、升级镜像或操作其他集群。
+
+## 完整范围与结果
+
+| 检查 | 结果 |
+| --- | --- |
+| 上游 drain + Kind 适配单测 | 本地与 Linux 均通过；500 项，未跳过 |
+| Linux 进程恢复集成（持久化 API 替身） | 6/6 通过 |
+| 全量 `just test` | 退出 0，`OK (1m46s)` |
+| 全量 `just lint` | 13/14 通过；仅已有 runner-base Dockerfile:36 的 Hadolint DL3066 失败 |
+| Ruff E/F/I、格式 | 均退出 0 |
+| drain 与服务端取消工作流预览及 actionlint | 均退出 0 |
+| 集群 guard、同版本 runner install | 均退出 0 |
+| 容量 probe | 退出 0，limits 与 advertised capacity 完成 3 → 0 → 3 |
+| 默认普通 E2E | 退出 1，900 秒内 inflight 没有获得 runner；未进入 drain |
+| 额外流量对照 E2E | 退出 0，四个原始 job 成功，held 放置和旧 taint 保留断言通过 |
+| 真实 Kind/GitHub 取消恢复 | 退出 0，SIGTERM、SIGKILL 孤儿 writer、仅分支残留三个场景通过 |
+| GitHub 服务端取消整个 job | 退出 0，原 job 的 restore 成功，successor 在恢复结束后启动 |
+| 最终独立审计 | 退出 0，源码、任务身份、容量、writer、PR/分支与 native runner 清理检查通过 |
+
+## 普通 E2E 与明确标记的对照
+
+默认 PR [82](https://github.com/kuring/ci-infra/pull/82)，原始
+[run 40505898114](https://github.com/kuring/ci-infra/actions/runs/40505898114)。
+20:42:42 找到原始 run，listener 持续报告容量 3，但 inflight 保持 queued；
+900 秒启动预算耗尽后退出 1。独立审计确认 PR 关闭、精确分支删除、run completed/cancelled。
+
+对照 PR [83](https://github.com/kuring/ci-infra/pull/83)，原始
+[run 40507975137](https://github.com/kuring/ci-infra/actions/runs/40507975137) success。
+对照保持上一轮已确认的辅助条件：**额外启动 1 次、上游自带 resume 1 次、额外 resume 1 次**。
+额外 resume 在上游单次唤醒后排队持续五分钟时发送，事件保存在
+`pulse-held-40507975137.json`，没有重跑或替换原始任务。
+
+| 北京时间 | 验证 |
+| --- | --- |
+| 20:58:09 | 本地显式开关注入一次启动流量 |
+| 20:58:33—20:58:56 | inflight 进入等待步骤，并在 drain 后成功结束 |
+| 20:59:06—21:00:06 | 三个 held 完成完整 60 秒排队观察 |
+| 21:00:06 | 原 worker 加 refresh taint，并记录 UID |
+| 21:00:07 | 预留 worker 启用，恢复 limits，旧节点 taint 验证通过 |
+| 21:00:19 | 上游发送一次 resume 唤醒；原始 held 继续排队 |
+| 21:05:21 | 额外发送一次 resume 流量，保留三个原始 held ID |
+| 21:06:20—21:06:22 | 三个 held 的 runner/workflow Pod 均在预留 worker 上，核对后释放 |
+| 21:06:40 | 所有原始 held 成功，最终 taint 保留检查通过 |
+| 21:06:46 | 对照控制器正常退出 0 |
+
+| 原始 job | ID | 结果 |
+| --- | --- | --- |
+| drain-held (1) | 122202516899 | success |
+| drain-held (2) | 122202516845 | success |
+| drain-held (3) | 122202516970 | success |
+| drain-inflight | 122202104120 | success |
+
+独立持续采样确认四个 job ID 始终一致。E2E 结束时，原节点
+`255ca592-211d-4a6b-8cb5-2d40dadfcece` 仍存在并带 refresh taint，
+三个 held 的 runner 和 workflow Pod 均使用预留节点
+`d90c3904-bf2a-4887-8122-3e483b2431d5`。
+这一结束状态在进入后续恢复测试前，另存并核验于 `e2e-assisted-audit.json`。
+
+## 真实取消恢复和并发锁
+
+真实恢复套件的三个场景全部通过，且**没有使用额外启动流量**：
+
+- SIGTERM：取消时没有 inline resume，由新进程恢复，再验证旧 PR/运行/分支回收。
+- SIGKILL：保留实际带 ownership token 的 recipe 进程，新进程通过 `/proc` 找到并停止它，
+  随后恢复完整 limits map，持续复查没有迟到的归零写入。
+- 仅分支残留：没有 PR 的中断分支被下一进程回收，新 canary 正常创建；相似对照分支内容保持不变。
+
+对应临时 PR 为 84—88，详见 `recovery-live/` 下各场景的 `result.json` 和总 `result.json`。
+
+服务端取消使用 PR [89](https://github.com/kuring/ci-infra/pull/89)，原始
+[run 40510103938](https://github.com/kuring/ci-infra/actions/runs/40510103938)，
+successor [run 40510272536](https://github.com/kuring/ci-infra/actions/runs/40510272536)。
+它在内部创建 PR [90](https://github.com/kuring/ci-infra/pull/90) 执行真实 ARC drain。
+这项验收也没有使用额外启动流量，取消通过普通 GitHub cancel API 发起。
+
+原 job 的 drain step 为 cancelled，`Resume and verify cluster runners` 为 success；
+外部清场前的 `observed-before-fallback.json` 已确认验收 passed，未依赖 fallback 恢复使测试通过。
+恢复步骤在北京时间 21:16:04.756 记录完成，
+successor 在 21:16:13.698 记录启动，
+单调时钟相差 8.941911 秒，锁观察窗口及释放顺序检查通过。
+
+## 最终状态与证据
+
+独立审计确认：9 个临时 PR（82—90）均关闭，全部精确测试分支和 sentinel 分支均删除；
+13 个本轮 canary workflow run 均 completed。两台专用 native runner 已注销，
+认证文件已移除，没有残留真实 runner/workflow Pod、带 ownership token 的 writer，
+也没有后台测试或观测进程。最终 maxRunners=3，advertised capacity=3。
+
+E2E 结束时的旧 taint 已单独证明保留。随后恢复测试按既有准备逻辑重置 worker，
+因此整轮结束时原 worker 无 refresh taint，预留 worker 回到 `kind-reserve` 标签并无 refresh taint。
+这次重置发生在 E2E 验证之后的新测试准备阶段。
+
+远端证据：`/root/drain-full-retest-20261027-203940/evidence/`。
+本地已下载并核对归档哈希，解包至 `.state/full-retest-20261027-203940/evidence/`。
+归档排除了 native runner 程序目录、工作目录和认证数据；关键元数据、日志与验收脚本保留。
+
+```text
+full-retest-20261027-203940-evidence.tar.gz
+SHA-256: 17eeadde5b83c5f8f4315872b90a9e348ffadda5dfe9eadcdfdc03cb3533d7f8
+```
+
+本轮不证明默认启动或单次 resume 唤醒已可靠，也不替代 AWS staging、Karpenter 节点供给
+或 GitHub-hosted runner 平台验收。普通 E2E、取消恢复和服务端取消的结果分别记录，
+主动取消的 run 不计为普通 E2E success。
+
+---
+
+# 上一轮 drain-test 验证（2026-10-27）
 
 **原始启动流程仍失败；额外启动和恢复流量下，完整 drain/resume 与放置验证通过。**
 不能将这次对照记为原始流程无条件通过，也不能据此宣告任务分配问题已解决。

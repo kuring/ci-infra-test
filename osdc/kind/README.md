@@ -1,7 +1,7 @@
 # 在独立 Kind 环境验证 ci-infra drain-test
 
 本目录属于 `ci-infra-test`，用于适配 `ci-infra` 的本地验证环境。上游代码保持不变。
-当前对照版本为 `ci-infra` 的 `15e9ff7c`
+当前对照版本为 `ci-infra` 的 `e7dbd06e`
 （`test: add verified OSDC drain and undrain slow test`）。
 
 `kind-drain` 直接导入上游 `DrainTest`、`run_controller`、断言和工作流模板，
