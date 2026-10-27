@@ -1,3 +1,123 @@
+# drain-test 唤醒修复验收（2026-10-28 01:37—01:59）
+
+**稳定正容量启动基线下，正常 drain E2E 与写入超时注入 E2E 均通过。**
+两轮各自的原始 inflight 和三个 held 全部成功；没有用 wakeup run 替代验收探针。
+最终 maxRunners 与 advertised capacity 均为 3，旧 worker 的 refresh taint 保留。
+
+## 代码与执行范围
+
+先 fetch 当前 `feature/drain-test-2`，发现远端历史被重写，保留旧 HEAD `930ea4b`
+到本地 `codex/drain-test-before-sync-20261028` 后同步到 `4fab2b6`。
+本轮修复提交为 ci-infra `96cf68d`，独立 lint 修复为 `c985ff0`；
+适配器基于 `06ebc63`，环境接口适配提交为 ci-infra-test `5327f2f`。
+远端受测快照与本地代码的 991 个文件哈希一致，结束时再次核对无漂移。
+
+通过 `workbench connect --instance-id i-t4ne3fqx0h2huvw840vm` 连接，
+仅操作已有专用 `kind-osdc-drain-local`，保留 GitHub scale set 注册 ID `26`。
+没有重建集群、重新注册 scale set、升级镜像或部署到 AWS staging。
+每轮先用现有 worker reset recipe 准备容量，并在正容量就绪后等待 60 秒建立启动基线；
+没有开启 `--startup-wakeup`。这不证明任意冷启动均可靠，也没有改变 resume 时的正式控制器逻辑。
+
+## 修复与回归
+
+- 本地容量为正不能证明 broker 已完成旧的零容量长轮询。恢复后最多发送八次逻辑唤醒，
+  每次确认写入后至少间隔 15 秒；每次发送或重试都复查完整 limits 和目标 listener 容量。
+  任一原始探针获分配后停止唤醒，共享完成预算不延长。
+- 每次逻辑唤醒缓存 parent、tree 和目标 commit。ref 写入超时后读取 HEAD：已应用则直接确认，
+  未应用则复用同一目标；出现非预期分支变化则失败，不覆盖他人更新。
+  未确认的 Git 对象创建可能留下不可达对象，但不会因此先发布未知提交。
+- 修正最新基线中的容量指标映射：部署的 fork 实际 CR / Pod 名均为带哈希的 listener 名。
+  优先匹配该名称，兼容短 CR 名，并继续校验其关联的 scale set，拒绝缺失或外来关联。
+- 回归覆盖本地容量 3 但 broker 延迟就绪、唤醒上限、分配后停止、容量回落、共享截止时间，
+  以及 tree / commit / ref 写入超时、已应用与未应用分支、非预期 HEAD 更新。
+- ci-infra-test 按最新 `env_overrides` 接口适配控制器与 Linux 恢复夹具；环境在启动时合并，
+  不在实例中缓存完整环境。没有为适配器修改上游接口或削弱断言。
+
+## 检查结果
+
+| 检查 | 结果 |
+| --- | --- |
+| 唤醒与容量映射的本地定向回归 | 43 项通过 |
+| 远端上游 drain + Kind 适配单测 | 626 项通过；复用上游 572 项，适配层自身 54 项 |
+| Linux 原生进程恢复集成，持久化 API 替身 | 6/6 通过；不等同真实 GitHub 取消验收 |
+| 上游全量 `just test` | 退出 0，`OK (1m38s)`，通过逐文件 95% 覆盖率门禁 |
+| 上游全量 `just lint` | 14/14 通过，`OK (18s)` |
+| 修改 Python 的 Ruff 检查与格式、diff 检查 | 通过 |
+| runner-base 数值 UID 修复 | 修改前后均为 UID/GID 1000，隔离容器工作目录可写；未构建完整 runner 镜像 |
+| 正常 drain E2E | 退出 0，原始四个探针全部 success，三次逻辑唤醒 |
+| 已接受 ref 写入后的客户端超时注入 | 退出 0，原始四个探针全部 success，三次逻辑唤醒、四次调用 |
+| 源码、原始 ID、落点、taint、清理与凭证扫描审计 | 通过 |
+
+## 正常轮次
+
+PR [101](https://github.com/kuring/ci-infra/pull/101)，原始
+[run 40553894603](https://github.com/kuring/ci-infra/actions/runs/40553894603)。
+执行 `just kind-drain test --start-timeout 600 --finish-timeout 600 --drain-timeout 300`。
+
+01:48:10 inflight 执行；01:48:20 limits / advertised capacity 均为零；01:48:32 inflight 成功。
+01:48:42—01:49:42 三个原始 held 在完整观察窗口保持 queued。
+01:49:43 为旧 worker 加 refresh taint、激活预留 worker；01:49:44 恢复 maxRunners=3。
+01:49:55、01:50:15、01:50:34 发送三次唤醒，之后不再发送。
+01:51:35—01:51:37 核验三个 held 的 runner / workflow Pod 均在 worker2，01:51:56 全部成功。
+这些时序证明本轮多次唤醒后的整体流程通过，不单独证明第三次唤醒是唯一触发因素。
+
+原始 job ID 保持 `122364643352`（inflight）、`122365179869`、`122365179920`、`122365180153`。
+三个新增 wakeup run 全部取消清理，原始 run 保持 success。
+
+## 写入超时轮次
+
+PR [102](https://github.com/kuring/ci-infra/pull/102)，原始
+[run 40554837803](https://github.com/kuring/ci-infra/actions/runs/40554837803)。
+使用相同控制器参数；仅在测试包装器中，对第一次实际成功的 wakeup ref PATCH
+返回之后抛出 `subprocess.TimeoutExpired`，模拟服务端已接受、客户端未获得确定结果。
+这是受控故障注入，不是自然网络故障。
+
+01:56:04 开始首个逻辑唤醒；目标提交为 `88e67398ea338712c98301b86d6f754a778b9d68`。
+01:56:13 重试读取 HEAD，日志确认 `already applied`；没有再次创建该目标 commit 或 PATCH ref。
+API trace 记录该目标 commit POST 一次、ref PATCH 一次、HEAD 回读两次。
+后续第二、第三次逻辑唤醒分别在 01:56:30、01:56:49；01:57:32—01:57:40 核验三个落点，
+01:57:57 原始 held 全部成功。
+
+原始 job ID 保持 `122367990119`（inflight）、`122368548465`、`122368548502`、`122368548640`。
+两轮各核验三组 held 的 runner / workflow Pod UID，全部位于 worker2 UID
+`d90c3904-bf2a-4887-8122-3e483b2431d5`，未复用旧 worker UID
+`255ca592-211d-4a6b-8cb5-2d40dadfcece`。
+
+## 中间失败与终态
+
+首次恢复夹具因残留 `self.env` 导致 4/6 失败，修正后 6/6 通过；首次集群预检暴露
+带哈希 listener CR 映射错误，修正后重跑单测、全量测试与 E2E。原始失败日志均保留。
+首次 lint 仍被已有 Dockerfile DL3066 拦截，独立固定数值 UID 后全部通过，未降低 lint 门槛。
+
+第一轮 PR [100](https://github.com/kuring/ci-infra/pull/100) 的 runner 报
+`No space left on device`，根分区满；主动终止控制器（退出 143），该轮不计成功。
+保留 Pod 日志、事件、取消与清理审计，再仅清理两个旧测试快照的可下载 provider 缓存，
+记录路径与文件大小，恢复约 2.3 GB 可用空间；没有删除源码或历史证据。
+
+PR100—102 均关闭，精确测试分支不存在，七个 wakeup / 失败运行均终止，两个成功原始 run 保持 success。
+旧 worker 的精确 refresh taint 保留；没有实际 runner / workflow Pod、测试控制器或带 ownership token 的 writer。
+清理后首份正容量快照为 2，保留该快照与审计失败记录，随后等待收敛，
+01:59:36 与 01:59:41 连续采样均为 3。最终 listener UID 为
+`7606f100-0646-48b6-845f-7d42116f0107`，注册 ID 仍为 26。
+
+## 证据
+
+远端：`/root/drain-wakeup-fix-20261028/evidence/`。
+本地：`.state/wakeup-fix-20261028/evidence/`，完整原始日志属于忽略产物，未提交到版本库。
+归档包括受测文件、991 文件源码哈希、逐步骤日志、API trace、原始 job / Pod / node UID、
+失败轮次、容量收敛、清理、进程与凭证扫描审计。内部 186 个文件哈希及下载归档哈希均已核对。
+不含 PAT、kubeconfig、私有环境文件或虚拟环境。
+
+```text
+evidence.tar.gz (318463 bytes)
+SHA-256: c4ff8ec98e9f5a00e65e7223a44448ba164321ba3d074362c436f5633597132e
+```
+
+本轮只验证专用 Kind / GitHub 链路，不覆盖 AWS staging、Karpenter 自动供给，
+也不把恢复夹具的 6/6 当作真实取消恢复验收。
+
+---
+
 # Broker / listener 消息定位（2026-10-28）
 
 **已直接复现 GitHub 侧旧任务重新匹配/向 broker 投递的缺口。**
