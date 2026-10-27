@@ -169,6 +169,9 @@ def test_kind_controller_reuses_shared_logic_with_local_identity(local, monkeypa
     test.deadline = 123
     assert test.cluster == module.LOCAL_CLUSTER
     assert test.env["KUBECONFIG"] == str(local / "kubeconfig")
+    monkeypatch.setenv("OSDC_KIND_ENV_AFTER_INIT", "inherited-at-launch")
+    assert test.env["OSDC_KIND_ENV_AFTER_INIT"] == "inherited-at-launch"
+    assert "OSDC_KIND_ENV_AFTER_INIT" not in test.env_overrides
     assert str(local) in test.env["MISE_TRUSTED_CONFIG_PATHS"].split(module.os.pathsep)
     api = Mock(return_value={"jobs": [{"runner_group_name": "Default"}, {"runner_group_name": "other"}, {}]})
     monkeypatch.setattr(module, "api", api)

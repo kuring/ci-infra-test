@@ -48,7 +48,7 @@ class FixtureDrain(DrainTest):
         self.draining = True
         self.drain = subprocess.Popen(
             [sys.executable, __file__, "writer", str(self.args.root_dir), self.args.writer_mode],
-            env={**self.env, **owner},
+            env={**os.environ, **self.env_overrides, **owner},
             start_new_session=True,
         )
         while not (self.args.root_dir / "writer-ready").exists():

@@ -347,7 +347,7 @@ class KindDrainTest(DrainTest):
         self.repository = REPOSITORY
         self.branch = f"codex/osdc-drain-test-kind-{key}"
         self.startup_wakeup_sent = False
-        self.env.update(
+        self.env_overrides.update(
             {
                 "KUBECONFIG": str(ROOT / "kubeconfig"),
                 "MISE_TRUSTED_CONFIG_PATHS": os.pathsep.join(
@@ -355,6 +355,10 @@ class KindDrainTest(DrainTest):
                 ),
             }
         )
+
+    @property
+    def env(self):
+        return {**os.environ, **self.env_overrides}
 
     def api(self, endpoint, payload=None, method="GET", **kwargs):
         return api(endpoint, payload, method, repository=self.repository, deadline=self.deadline, **kwargs)
