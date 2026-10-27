@@ -5,6 +5,7 @@ import base64
 import json
 import subprocess
 import sys
+from threading import Event
 from unittest.mock import Mock
 
 import drain_test_kind as module
@@ -195,6 +196,24 @@ def test_kind_controller_reuses_shared_logic_with_local_identity(local, monkeypa
     for job in workflow["jobs"].values():
         assert job["runs-on"] == module.LABEL
         assert "head.repo.full_name" in job["if"]
+
+
+def test_kind_metric_scrape_forwards_cancellation_to_command(local, monkeypatch):
+    test = module.KindDrainTest(args(local), "abc")
+    test.deadline = 123
+    event = Event()
+    command = Mock(return_value=subprocess.CompletedProcess([], 0, "metrics", ""))
+    monkeypatch.setattr(module, "command", command)
+    assert test.kube("get", "--raw", "/metrics", deadline=100, cancel_event=event) == "metrics"
+    assert command.call_args.kwargs["deadline"] == 100
+    assert command.call_args.kwargs["cancel_event"] is event
+    assert command.call_args.args[0][:5] == [
+        "kubectl",
+        "--kubeconfig",
+        str(local / "kubeconfig"),
+        "--context",
+        module.CONTEXT,
+    ]
 
 
 def test_kind_workflow_preserves_shared_probes_and_pull_request_trigger():

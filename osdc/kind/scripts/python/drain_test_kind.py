@@ -359,8 +359,8 @@ class KindDrainTest(DrainTest):
     def api(self, endpoint, payload=None, method="GET", **kwargs):
         return api(endpoint, payload, method, repository=self.repository, deadline=self.deadline, **kwargs)
 
-    def kube(self, *args, deadline=None):
-        return kube(*args, deadline=deadline if deadline is not None else self.deadline)
+    def kube(self, *args, deadline=None, cancel_event=None):
+        return kube(*args, deadline=deadline if deadline is not None else self.deadline, cancel_event=cancel_event)
 
     def prepare(self):
         guard()
