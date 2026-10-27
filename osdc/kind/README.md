@@ -1,9 +1,9 @@
 # 在独立 Kind 环境验证 ci-infra drain-test
 
 本目录属于 `ci-infra-test`，用于适配 `ci-infra` 的本地验证环境。上游代码保持不变。
-最新对照：只重建 listener 后 held 恢复超时，重新注册 scale set 后 inflight 启动超时；
-两轮均已清理，当前注册 ID 为 26、容量为 3。详见[当前验证记录](docs/current-validation.md)。
-此前 547 项回归、Linux 恢复 6/6 和容量 probe 已通过。
+最新诊断已复现：任务在 broker 容量 0 时入队，升为 3 后仍无分配消息，新增任务后旧任务被投递。
+实际 ARC 收到分配后能创建 runner 并执行任务；具体触发时序与结论边界见[当前验证记录](docs/current-validation.md)。
+此前普通 drain E2E 尚未通过，547 项回归、Linux 恢复 6/6 和容量 probe 已通过。
 当前对照版本为 `ci-infra` 的 `a09b8a5`
 （`test: add verified OSDC drain and undrain slow test`）。
 

@@ -1,3 +1,17 @@
+# Broker / listener 消息定位（2026-10-28）
+
+**已直接复现 GitHub 侧旧任务重新匹配/向 broker 投递的缺口。**
+首轮容量 3 时，0.297 秒收到三个 JobAssigned；任务在容量 0 时入队再升至 3，
+两次约 50 秒的正容量请求仍是 HTTP 202、assigned=0；新增同标签任务后，
+0.318 秒收到三个原旧任务的 JobAssigned。独立实验不经过 ARC / Kubernetes。
+实际 ID26 listener 另验证了 assigned=1 → ERS=1 → runner180 与 workflow Pod 执行。
+
+本地容量就绪与首轮 broker 轮询之间的时差，是具体候选触发机制，尚未逐请求抓取部署 listener 请求头。
+详情、证据及结论边界见[消息链路诊断](broker-message-diagnosis-20261028.md)。
+临时资源已清理，ID26 容量保持 3；普通 drain E2E 的此前失败结论未改变。
+
+---
+
 # Listener / scale set 对照（2026-10-27 23:14—23:49）
 
 **两种重建都未通过完整 E2E。** 只重建 listener、保留注册 ID `25` 后，
