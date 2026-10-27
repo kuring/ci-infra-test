@@ -9,7 +9,7 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-from drain_test_run import wait_for
+from drain_test_kind import wait_for
 
 
 def runner_archive(test, cache):

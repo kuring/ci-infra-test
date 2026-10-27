@@ -36,9 +36,7 @@ from drain_test_run import (  # noqa: E402
     generate_workflow,
     positive,
     run_controller,
-    wait_for,
 )
-from runner_constants import REFRESH_TAINT_EFFECT, REFRESH_TAINT_KEY, REFRESH_TAINT_VALUE  # noqa: E402
 
 ROOT = LOCAL / ".state"
 LOCAL_CLUSTER = "kind-local"
@@ -48,12 +46,12 @@ LABEL = "osdc-kind-drain"
 VERSION = "0.14.1-jeanschmidt.20"
 
 
-def refresh_tolerations():
-    # Kind has no node provisioner; keep the shared taint assertions while
-    # allowing local probes to use its single, surviving worker.
-    return [
-        {"key": REFRESH_TAINT_KEY, "operator": "Equal", "value": REFRESH_TAINT_VALUE, "effect": REFRESH_TAINT_EFFECT}
-    ]
+def wait_for(description, check, timeout, poll=10):
+    # Acceptance orchestration outside a controller still needs bounded waits.
+    # Reuse the upstream deadline implementation with a fresh, isolated scope.
+    waiter = DrainTest.__new__(DrainTest)
+    waiter.deadline = None
+    waiter.wait_for(description, check, timeout, poll=poll)
 
 
 def generate_kind_workflow(key):
@@ -140,7 +138,6 @@ def runner_values() -> dict:
         "template": {
             "spec": {
                 "nodeSelector": {"node-fleet": "kind-local"},
-                "tolerations": refresh_tolerations(),
                 "containers": [
                     {
                         "name": "runner",
@@ -198,6 +195,14 @@ kubeconfig cluster:
     [[ "{{{{cluster}}}}" == "{LOCAL_CLUSTER}" ]] || {{ echo "Local cluster only" >&2; exit 1; }}
     [[ "${{KUBECONFIG:-}}" == "{{{{ROOT}}}}/kubeconfig" ]] || {{ echo "Isolated kubeconfig required" >&2; exit 1; }}
     just --justfile "{LOCAL}/justfile" kind-drain-guard
+
+kind-prepare-workers cluster:
+    [[ "{{{{cluster}}}}" == "{LOCAL_CLUSTER}" ]]
+    just --justfile "{LOCAL}/justfile" kind-drain-workers reset
+
+kind-activate-reserve cluster:
+    [[ "{{{{cluster}}}}" == "{LOCAL_CLUSTER}" ]]
+    just --justfile "{LOCAL}/justfile" kind-drain-workers activate
 '''
     files = {
         defs / "local.yaml": yaml.safe_dump({"runner": {"name": LABEL, "max_runners": 3}}),
@@ -254,7 +259,6 @@ def install() -> None:
         "kind": "Pod",
         "spec": {
             "nodeSelector": {"node-fleet": "kind-local"},
-            "tolerations": refresh_tolerations(),
             "containers": [
                 {
                     "name": "$job",
@@ -342,6 +346,7 @@ class KindDrainTest(DrainTest):
         self.probe_label = LABEL
         self.repository = REPOSITORY
         self.branch = f"codex/osdc-drain-test-kind-{key}"
+        self.startup_wakeup_sent = False
         self.env.update(
             {
                 "KUBECONFIG": str(ROOT / "kubeconfig"),
@@ -352,10 +357,10 @@ class KindDrainTest(DrainTest):
         )
 
     def api(self, endpoint, payload=None, method="GET", **kwargs):
-        return api(endpoint, payload, method, repository=self.repository, **kwargs)
+        return api(endpoint, payload, method, repository=self.repository, deadline=self.deadline, **kwargs)
 
-    def kube(self, *args):
-        return kube(*args)
+    def kube(self, *args, deadline=None):
+        return kube(*args, deadline=deadline if deadline is not None else self.deadline)
 
     def prepare(self):
         guard()
@@ -365,6 +370,7 @@ class KindDrainTest(DrainTest):
                 ["uv", "run", str(UPSTREAM / "modules/arc-runners/scripts/python/runner_max_map.py"), self.cluster],
                 cwd=ROOT,
                 env=self.env,
+                deadline=self.deadline,
             ).stdout
         )
 
@@ -381,16 +387,43 @@ class KindDrainTest(DrainTest):
                 job["runner_group_name"] = "default"
         return jobs
 
+    def taint_runner_nodes(self):
+        super().taint_runner_nodes()
+        # Kind has no provisioner. Make an existing fresh worker eligible only
+        # after upstream recorded the old worker's taint and UID baseline.
+        self.recipe("kind-activate-reserve")
+
+    def inflight_ready(self):
+        if super().inflight_ready():
+            return True
+        if not getattr(self.args, "startup_wakeup", False) or "inflight" in self.assigned_phases:
+            return False
+        if not self.startup_wakeup_sent:
+            items = self.scale_sets()
+            require_limits(runner_limits(items), self.desired)
+            target = self.check_probe(items)
+            if self.capacities({target}).get(target, 0) <= 0:
+                raise ValueError("Waiting for positive capacity before the explicit Kind startup wakeup")
+            if self.deadline is None:
+                raise RuntimeError("Kind startup wakeup requires an active controller deadline")
+            # Record intent before writes so uncertain API responses cannot
+            # inject repeated traffic. Original job IDs remain upstream-owned.
+            self.startup_wakeup_sent = True
+            logging.info("Kind-only comparison: injecting one explicit inflight startup wakeup")
+            self.wakeup("inflight", 1, self.deadline)
+        return False
+
     def run(self):
         if getattr(self.args, "action", "test") != "probe":
+            self.recipe("kind-prepare-workers")
             super().run()
             return
         self.prepare()
         require_limits(runner_limits(self.scale_sets()), self.desired)
-        wait_for("listener metrics available", lambda: bool(self.capacities()), self.args.drain_timeout)
+        self.wait_for("listener metrics available", lambda: bool(self.capacities()), self.args.drain_timeout)
         self.draining = True
         self.recipe("drain-runners")
-        wait_for("zero runner limits and advertised capacity", self.drained, self.args.drain_timeout)
+        self.wait_for("zero runner limits and advertised capacity", self.drained, self.args.drain_timeout)
         self.resume()
 
         def restored():
@@ -399,13 +432,16 @@ class KindDrainTest(DrainTest):
                 raise ValueError("Waiting for the local warm reservation to advertise capacity")
             return True
 
-        wait_for("configured limits and local advertised capacity restored", restored, self.args.drain_timeout)
+        self.wait_for("configured limits and local advertised capacity restored", restored, self.args.drain_timeout)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["render", "install", "test", "restore", "probe"])
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--startup-wakeup", action="store_true", help="Opt-in Kind comparison: inject one startup traffic pulse"
+    )
     parser.add_argument("--run-timeout", type=positive, default=RUN_TIMEOUT)
     parser.add_argument("--cleanup-timeout", type=positive, default=CLEANUP_TIMEOUT)
     parser.add_argument("--restore-timeout", type=positive, default=RESTORE_TIMEOUT)

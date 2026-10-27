@@ -20,7 +20,8 @@ from uuid import uuid4
 
 import drain_test_kind as kind
 from drain_test_checks import require_limits, runner_limits
-from drain_test_run import CLEANUP_TIMEOUT, RESTORE_TIMEOUT, RUN_TIMEOUT, run_controller, wait_for
+from drain_test_kind import wait_for
+from drain_test_run import CLEANUP_TIMEOUT, RESTORE_TIMEOUT, RUN_TIMEOUT, run_controller
 
 BRANCH = "codex/osdc-drain-recovery-kind"
 

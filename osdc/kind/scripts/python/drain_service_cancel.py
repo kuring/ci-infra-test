@@ -8,6 +8,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 import time
@@ -18,7 +19,8 @@ import drain_test_kind as kind
 import yaml
 from drain_recovery_kind import RecoveryKind, controller_args, require, save, verify_restored
 from drain_test_checks import require_limits, runner_limits
-from drain_test_run import run_controller, wait_for
+from drain_test_kind import wait_for
+from drain_test_run import WORKFLOW_NAME_PREFIX, run_controller
 from service_runner import NativeRunner, runner_archive
 
 
@@ -44,6 +46,9 @@ def generate_workflow(key, output, runners):
     job["name"] = "Cancel drain and recover"
     job["runs-on"] = [runners[0]]
     job["concurrency"]["group"] = "osdc-service-cancel-" + key
+    # The local worker's guard replaces the staging input boundary; a PR event
+    # has no reusable-workflow inputs.cluster value.
+    job["if"] = job["if"].replace("inputs.cluster == 'meta-staging-aws-uw1' && ", "")
     job["if"] = job["if"].replace(" }}", " && github.event.action == 'opened' }}")
     prefix = " ".join(
         shlex.quote(str(p)) for p in ["just", "--justfile", kind.LOCAL / "justfile", "kind-drain-service-step"]
@@ -59,12 +64,18 @@ def generate_workflow(key, output, runners):
         "run": run("prepare"),
     }
     drain = copy.deepcopy(next(s for s in source["steps"] if s.get("id") == "drain"))
+    recovery_file = re.search(r'--recovery-file "([^"]+)"', drain["run"])
+    if recovery_file is None:
+        raise ValueError("Formal drain step is missing its recovery-file argument")
+    recovery_path = recovery_file.group(1)
     drain["run"] = run("cancel")
     # runner.temp is only available in step env, as in the formal workflow.
     # The worker reads the owner-only PAT locally instead of a YAML secret.
     drain["env"].pop("GH_TOKEN")
+    drain["env"]["OSDC_DRAIN_RECOVERY_FILE"] = recovery_path
     restore = copy.deepcopy(next(s for s in source["steps"] if s.get("id") == "restore"))
     restore["run"] = run("restore")
+    restore.setdefault("env", {})["OSDC_DRAIN_RECOVERY_FILE"] = recovery_path
     job["steps"] = [prepare, drain, restore]
     successor = {
         "name": "Acquire released lock",
@@ -76,7 +87,7 @@ def generate_workflow(key, output, runners):
     }
     return yaml.safe_dump(
         {
-            "name": "OSDC Service Cancel " + key,
+            "name": WORKFLOW_NAME_PREFIX + "service" + key,
             "on": {"pull_request": {"types": ["opened", "synchronize"]}},
             "permissions": {"contents": "read"},
             "jobs": {"drain": job, "successor": successor},
@@ -136,7 +147,7 @@ class ServiceCanary(kind.KindDrainTest):
     def __init__(self, args, key, output, runners):
         super().__init__(args, key)
         self.branch = "codex/osdc-service-cancel-" + key
-        self.workflow_name = "OSDC Service Cancel " + key
+        self.workflow_name = WORKFLOW_NAME_PREFIX + "service" + key
         self.output, self.runners = output, runners
 
     def workflow(self):

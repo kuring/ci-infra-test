@@ -1,8 +1,8 @@
 # 在独立 Kind 环境验证 ci-infra drain-test
 
 本目录属于 `ci-infra-test`，用于适配 `ci-infra` 的本地验证环境。上游代码保持不变。
-当前对照版本为 `ci-infra` 的 `06c039c1de9eb7983f0b5415046a28deb28d612d`
-（`test: add OSDC drain and undrain slow test`）。
+当前对照版本为 `ci-infra` 的 `15e9ff7c`
+（`test: add verified OSDC drain and undrain slow test`）。
 
 `kind-drain` 直接导入上游 `DrainTest`、`run_controller`、断言和工作流模板，
 并通过生成的 consumer justfile 导入上游 drain/resume recipe，仅覆盖 kubeconfig 连接。
@@ -105,10 +105,26 @@ kubectl -n arc-runners get autoscalingrunnersets,pods
 
 ## 运行与验收
 
-Kind 没有节点自动供给能力。本地 runner 和 workflow Pod 显式容忍
-`deploy.osdc.io/refresh-pending=true:NoSchedule`，以便在唯一 worker 保留
-refresh taint 时完成任务恢复；控制器仍验证 taint 保留及按所有权清理。
-这项本地适配不覆盖 refresh taint 阻止新任务调度、节点替换或 Karpenter 供给行为。
+Kind 没有节点自动供给能力。本地集群使用两个 worker：原 worker 初始属于
+`kind-local` runner fleet；预留 worker 使用 `kind-reserve` 标签，初始不接收 runner、
+workflow 或容量 placeholder Pod。上游完成 drain、held 排队观察并记录原 worker 的
+refresh taint/UID 后，本地适配将预留 worker 加入 `kind-local`，然后执行原始 resume。
+runner 和 workflow Pod 不容忍 refresh taint；原 worker 保留 taint，恢复任务使用预留 worker。
+上游仍检查实际 Pod/节点证据、原任务身份和 taint 保留，再释放 held 任务。
+
+每次普通测试开始前等待前次 runner/workflow Pod 全部消失，再将预留 worker 移出 fleet，
+清除两个专用 worker 的上次测试 refresh taint。这是下一次测试的准备动作；本次 resume、
+restore 和结束审计都保留旧节点 taint。容量 probe 与 restore 不重置 worker。
+该适配验证真实调度隔离和非旧节点放置，仍不覆盖 Karpenter 自动供给或实际节点替换。
+
+已有单 worker 集群需要迁移。以下入口先核对旧集群的 context、精确节点名和所有权标签，
+注销本地 runner release，再仅重建 `osdc-drain-local`；之后重新部署 controller 与 runner：
+
+```bash
+just kind-drain-recreate
+just kind-drain-controller
+just kind-drain install
+```
 
 同一集群一次只运行一个测试，期间不要 install、reset 或重启 listener。
 
@@ -123,9 +139,22 @@ just kind-drain test --start-timeout 600 --finish-timeout 600
 可用参数还有 `--drain-timeout`（默认 180 秒）、`--observe-seconds`（默认 60 秒）。
 旧 `--simulate-drain-noop` 参数在上游已无对应实现，已移除，避免无效的反向控制。
 
+默认保持上游原始启动行为。如果 GitHub 的原始 inflight 长期 queued，而 listener 已报告
+正容量，可在保存原始失败后运行显式对照：
+
+```bash
+just kind-drain test --startup-wakeup --start-timeout 900 --finish-timeout 900
+```
+
+该本地开关仅在原始 inflight 尚未分配且 limits/advertised capacity 正确时，调用上游
+`wakeup` 注入一次新任务流量。不会重跑或替换原始 job，不在 drain 窗口发送流量，
+写入结果不确定时也不会重复发送。后续 resume 阶段沿用上游自己的唤醒行为。
+启用此对照后通过，必须记录为“额外启动流量下通过”，不能据此宣告原始启动问题已解决。
+
 通过标准保持上游语义：inflight 在 drain 后成功完成；maxRunners 与 listener advertised
 capacity 同时归零；三个 held 任务在 60 秒观察期间保持 queued 且没有 runner；
-resume 后三个 held 全部成功，runner group 正确，资源恢复并清理成功。退出码必须为 0。
+resume 后三个 held 全部成功，runner group 正确，runner 与 workflow Pod 均位于非旧节点 UID，
+资源恢复并清理成功。退出码必须为 0。
 本地预览、离线单测或容量 probe 通过，都不代表真实 E2E 通过。
 
 ### CI 取消恢复与固定分支残留回收

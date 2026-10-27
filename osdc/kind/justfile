@@ -34,13 +34,27 @@ kind-drain-guard:
     #!/usr/bin/env bash
     set -euo pipefail
     source "{{OSDC}}/scripts/mise-activate.sh"
-    KUBE="{{STATE}}/kubeconfig"
-    CONTEXT=$(kubectl --kubeconfig "$KUBE" config current-context)
-    echo "guard: kubeconfig=$KUBE"
-    echo "guard: context=$CONTEXT"
-    [[ "$CONTEXT" == "kind-osdc-drain-local" ]] || { echo "Not the owned kind context" >&2; exit 1; }
-    kubectl --kubeconfig "$KUBE" --context kind-osdc-drain-local get nodes -o json \
-        | uv run python -c 'import json,sys; nodes=json.load(sys.stdin)["items"]; expected={"osdc-drain-local-control-plane", "osdc-drain-local-worker"}; names=sorted(n["metadata"]["name"] for n in nodes); ok=set(names)==expected and all(n["metadata"].get("labels",{}).get("osdc.io/drain-kind")=="true" for n in nodes); print("guard: nodes ok: " + ", ".join(names)) if ok else print("Unexpected kind nodes or ownership labels: " + ", ".join(names), file=sys.stderr); sys.exit(0 if ok else 1)'
+    uv run --frozen "{{LOCAL}}/scripts/python/kind_workers.py" guard
+
+# Rebuild only this owned test cluster to migrate from one to two workers.
+kind-drain-recreate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    uv run --frozen "{{LOCAL}}/scripts/python/kind_workers.py" guard --allow-legacy
+    cp -p "{{STATE}}/kubeconfig" "{{STATE}}/kubeconfig.before-reserve"
+    helm uninstall osdc-kind-drain --namespace arc-runners \
+        --kubeconfig "{{STATE}}/kubeconfig" --kube-context kind-osdc-drain-local \
+        --ignore-not-found --wait --timeout 180s
+    kind delete cluster --name osdc-drain-local
+    just --justfile "{{LOCAL}}/justfile" kind-drain-create
+
+# Local capacity staging; upstream drain/resume and assertions remain unchanged.
+kind-drain-workers action:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{OSDC}}/scripts/mise-activate.sh"
+    uv run --frozen "{{LOCAL}}/scripts/python/kind_workers.py" "{{action}}"
 
 # Foreground local HTTP-to-SOCKS5 relay. Ctrl-C stops it; no system proxy changes.
 kind-drain-proxy:

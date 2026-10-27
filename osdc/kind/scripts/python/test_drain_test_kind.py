@@ -87,7 +87,7 @@ def test_render_keeps_real_recipes_and_changes_only_connection(local):
     assert values["runnerGroup"] == "default"
     assert "github_pat_" not in (local / "runner-values.yaml").read_text()
     assert values["containerMode"]["type"] == "kubernetes-novolume"
-    assert values["template"]["spec"]["tolerations"] == module.refresh_tolerations()
+    assert not values["template"]["spec"].get("tolerations")
     env = {e["name"]: e["value"] for e in values["listenerTemplate"]["spec"]["containers"][0]["env"]}
     assert env["CAPACITY_AWARE_ENABLED"] == "true"
     assert env["CAPACITY_AWARE_PROACTIVE_CAPACITY"] == "3"
@@ -112,7 +112,7 @@ def test_install_sends_secret_via_stdin_and_checks_version(local, monkeypatch):
     assert base64.b64decode(secret["data"]["github_token"]).decode() == "github_pat_fixture"
     assert all("github_pat_" not in str(c.args) for c in kube.call_args_list)
     job_template = json.loads(kube.call_args_list[2].kwargs["input"])
-    assert yaml.safe_load(job_template["data"]["pod.yaml"])["spec"]["tolerations"] == module.refresh_tolerations()
+    assert not yaml.safe_load(job_template["data"]["pod.yaml"])["spec"].get("tolerations")
     assert cmd.call_args.args[0][:3] == ["helm", "upgrade", "--install"]
     assert module.CONTEXT in cmd.call_args.args[0]
     (chart / "Chart.yaml").write_text("version: wrong\n")
@@ -165,6 +165,7 @@ def test_install_fetches_missing_chart(local, monkeypatch):
 
 def test_kind_controller_reuses_shared_logic_with_local_identity(local, monkeypatch):
     test = module.KindDrainTest(args(local), "abc")
+    test.deadline = 123
     assert test.cluster == module.LOCAL_CLUSTER
     assert test.env["KUBECONFIG"] == str(local / "kubeconfig")
     assert str(local) in test.env["MISE_TRUSTED_CONFIG_PATHS"].split(module.os.pathsep)
@@ -172,9 +173,13 @@ def test_kind_controller_reuses_shared_logic_with_local_identity(local, monkeypa
     monkeypatch.setattr(module, "api", api)
     assert test.jobs() == [{"runner_group_name": "default"}, {"runner_group_name": "other"}, {}]
     assert api.call_args.kwargs["repository"] == module.REPOSITORY
+    assert api.call_args.kwargs["deadline"] == 123
     kube = Mock(return_value="ok")
     monkeypatch.setattr(module, "kube", kube)
     assert test.kube("get", "nodes") == "ok"
+    assert kube.call_args.kwargs["deadline"] == 123
+    test.kube("get", "nodes", deadline=100)
+    assert kube.call_args.kwargs["deadline"] == 100
     guard = Mock()
     monkeypatch.setattr(module, "guard", guard)
     recipe = Mock()
@@ -255,7 +260,7 @@ def test_probe_checks_real_limits_and_capacity_without_github(local, monkeypatch
     monkeypatch.setattr(test, "recipe", recipe)
     resume = Mock()
     monkeypatch.setattr(test, "resume", resume)
-    monkeypatch.setattr(module, "wait_for", lambda description, check, timeout: check())
+    monkeypatch.setattr(test, "wait_for", lambda description, check, timeout: check())
     test.run()
     recipe.assert_called_once_with("drain-runners")
     resume.assert_called_once()
@@ -267,8 +272,96 @@ def test_probe_checks_real_limits_and_capacity_without_github(local, monkeypatch
 def test_kind_full_test_uses_shared_run(local, monkeypatch):
     parent = Mock()
     monkeypatch.setattr(module.DrainTest, "run", parent)
+    recipe = Mock()
+    monkeypatch.setattr(module.KindDrainTest, "recipe", recipe)
     module.KindDrainTest(args(local), "abc").run()
     parent.assert_called_once()
+    recipe.assert_called_once_with("kind-prepare-workers")
+
+
+def test_reserve_activation_follows_upstream_taint_baseline(local, monkeypatch):
+    test = module.KindDrainTest(args(local), "abc")
+    events = []
+
+    def record(self):
+        self.refresh_nodes = {"old-worker-uid": "old-worker"}
+        events.append("upstream")
+
+    def recipe(name):
+        assert test.refresh_nodes == {"old-worker-uid": "old-worker"}
+        events.append(name)
+
+    monkeypatch.setattr(module.DrainTest, "taint_runner_nodes", record)
+    monkeypatch.setattr(test, "recipe", recipe)
+    test.taint_runner_nodes()
+    assert events == ["upstream", "kind-activate-reserve"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_startup_wakeup_is_explicit_once_and_requires_positive_capacity(local, monkeypatch, enabled):
+    values = args(local)
+    values.startup_wakeup = enabled
+    test = module.KindDrainTest(values, "abc")
+    test.deadline = 123
+    test.desired = {module.LABEL: 3}
+    monkeypatch.setattr(module.DrainTest, "inflight_ready", lambda self: False)
+    monkeypatch.setattr(test, "scale_sets", lambda: [{"metadata": {"name": module.LABEL}, "spec": {"maxRunners": 3}}])
+    monkeypatch.setattr(test, "check_probe", lambda items: module.LABEL)
+    caps = Mock(return_value={module.LABEL: 0})
+    monkeypatch.setattr(test, "capacities", caps)
+    wakeup = Mock()
+    monkeypatch.setattr(test, "wakeup", wakeup)
+    if enabled:
+        with pytest.raises(ValueError, match="positive capacity"):
+            test.inflight_ready()
+        wakeup.assert_not_called()
+        caps.return_value = {module.LABEL: 3}
+        test.deadline = None
+        with pytest.raises(RuntimeError, match="active controller deadline"):
+            test.inflight_ready()
+        test.deadline = 123
+    assert not test.inflight_ready()
+    assert not test.inflight_ready()
+    if enabled:
+        wakeup.assert_called_once_with("inflight", 1, 123)
+    else:
+        wakeup.assert_not_called()
+
+
+def test_startup_comparison_never_wakes_an_assigned_job_or_retries_uncertain_write(local, monkeypatch):
+    values = args(local)
+    values.startup_wakeup = True
+    test = module.KindDrainTest(values, "abc")
+    test.deadline = 123
+    test.desired = {module.LABEL: 3}
+    monkeypatch.setattr(module.DrainTest, "inflight_ready", lambda self: False)
+    wakeup = Mock(side_effect=subprocess.TimeoutExpired("gh", 1))
+    monkeypatch.setattr(test, "wakeup", wakeup)
+    test.assigned_phases.add("inflight")
+    assert not test.inflight_ready()
+    wakeup.assert_not_called()
+    test.assigned_phases.clear()
+    monkeypatch.setattr(test, "scale_sets", lambda: [{"metadata": {"name": module.LABEL}, "spec": {"maxRunners": 3}}])
+    monkeypatch.setattr(test, "check_probe", lambda items: module.LABEL)
+    monkeypatch.setattr(test, "capacities", lambda expected: {module.LABEL: 3})
+    with pytest.raises(subprocess.TimeoutExpired):
+        test.inflight_ready()
+    assert not test.inflight_ready()
+    assert wakeup.call_count == 1
+
+
+def test_acceptance_wait_reuses_upstream_deadline_scope(monkeypatch):
+    calls = []
+
+    def wait(self, description, check, timeout, poll):
+        assert self.deadline is None
+        calls.append((description, check(), timeout, poll))
+        self.deadline = 123
+
+    monkeypatch.setattr(module.DrainTest, "wait_for", wait)
+    module.wait_for("first", lambda: True, 4, poll=0.1)
+    module.wait_for("second", lambda: False, 8)
+    assert calls == [("first", True, 4, 0.1), ("second", False, 8, 10)]
 
 
 def test_upstream_import_is_the_configured_checkout():

@@ -97,11 +97,13 @@ def test_fixed_branch_reclaimed_by_next_process(tmp_path, has_pr):
     ref = f"refs/heads/{branch}"
     old = {
         "refs": [ref, ref + "-other"],
-        "pulls": [{"number": 10, "state": "open"}] if has_pr else [],
+        "pulls": [{"number": 10, "state": "open", "title": "[NO REVIEW][NO MERGE] OSDC Drain Test fixture"}]
+        if has_pr
+        else [],
         "runs": [
-            {"id": 1, "status": "queued"},
-            {"id": 2, "status": "in_progress"},
-            {"id": 3, "status": "completed", "conclusion": "success"},
+            {"id": 1, "name": "OSDC Drain Test fixture1", "status": "queued"},
+            {"id": 2, "name": "OSDC Drain Test fixture2", "status": "in_progress"},
+            {"id": 3, "name": "OSDC Drain Test fixture3", "status": "completed", "conclusion": "success"},
         ],
     }
     (tmp_path / "github.json").write_text(json.dumps(old))

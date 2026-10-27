@@ -1,4 +1,127 @@
-# drain-test ECS 验证（2026-10-20）
+# drain-test 当前验证（2026-10-27）
+
+**原始启动流程仍失败；额外启动和恢复流量下，完整 drain/resume 与放置验证通过。**
+不能将这次对照记为原始流程无条件通过，也不能据此宣告任务分配问题已解决。
+
+本轮在 ECS `i-t4ne3fqx0h2huvw840vm`（Linux x86_64）的专用
+`kind-osdc-drain-local` 执行。按用户选择，将本地集群重建为一个 control-plane、
+原 worker 和预留 worker；镜像仍为 `kindest/node:v1.33.1`，ARC 仍为
+`0.14.1-jeanschmidt.20`。未操作 AWS staging 或其他 Kind 集群。
+
+上游基于 `15e9ff7c`，包含本轮开始时已有的两个未提交 Python 修改；没有修改上游代码。
+两轮使用相同上游快照，完整文件哈希保存在各自的 `evidence/source-manifest.json`。
+固定控制器 SHA-256 为：
+
+```text
+1b61b84eec5527f28ff4d30d20f3c66028bd4a8335e50f7d142dd60d6cbb5187
+```
+
+验证不覆盖快照生成后的上游并发修改。
+
+## 检查结果
+
+| 检查 | 本轮结果 |
+| --- | --- |
+| 上游 drain + Kind 适配单测 | 预留 worker 适配 463 项通过；增加显式启动对照后 466 项通过 |
+| Linux 原生进程恢复集成 | 6/6 通过，覆盖 SIGINT、SIGTERM、SIGKILL 孤儿 writer 和分支回收 |
+| 专用集群重建、controller/runner 部署 | 全部退出 0 |
+| 实际容量 probe | 退出 0，limits 和 advertised capacity 完成 3 → 0 → 3 |
+| 固定上游快照全量 `just test` | 退出 0，`OK (1m48s)` |
+| 本轮前置全量 `just lint` | 13/14 通过；仅未修改的 runner-base Dockerfile 第 36 行 Hadolint DL3066 失败 |
+| 修改 Python 的 Ruff E/F/I、格式 | 通过；新 worker 管理模块及测试的完整 Ruff 检查也通过 |
+| 最终生成 drain 工作流 actionlint | 退出 0，显式声明本地 runner label |
+| 原始普通 E2E | 退出 1：900 秒内 inflight 未分配，尚未进入 drain |
+| 额外流量对照 E2E | 退出 0：原始四个 job 全部 success，held 放置与旧节点 taint 保留断言全部通过 |
+| 最终独立审计 | 退出 0：源码一致、原 job ID 稳定、容量恢复、资源清理与节点证据均符合预期 |
+| 真实恢复/服务端取消验收 | 本轮未重跑；其单测与工作流适配已修复 |
+
+## 本地适配
+
+仅在 `ci-infra-test` 修复现有接口适配：移除对上游模块级 `wait_for` 和已删除
+`runner_constants` 的依赖，复用上游实例级 deadline 逻辑，并在本地 API/kubectl
+调用中传递 deadline。服务端取消工作流从正式命令提取恢复文件路径，以本地 Kind guard
+替代 staging input 条件，并使用正式清理器可以识别的 canary 名称。
+Linux 分支回收 fixture 补齐真实 canary 名称和 PR 标题，保留严格所有权校验。
+
+预留 worker 最初使用 `kind-reserve` 标签，不接收 runner、workflow 或容量 placeholder Pod。
+测试先等待前次真实 Pod 清理，重置专用 worker，随后直接运行上游控制器。
+上游完成 held 排队观察、给原 worker 加 taint 并记录 UID 后，才将预留 worker 加入
+`kind-local` runner fleet。runner 与 workflow Pod 均移除旧的 refresh-taint toleration。
+没有覆盖或跳过上游 drain、resume、taint、任务身份或 Pod 放置断言。
+
+`--startup-wakeup` 是默认关闭的本地对照开关，仅在原始 inflight 尚未分配且容量为正时
+调用一次上游 `wakeup`，不会重复写入或替换原始任务。本次恢复阶段的额外流量由用户
+另外确认，通过独立进程调用上游 `wakeup('held', 2, ...)`，并单独保存干预前后的证据。
+该额外恢复干预不是默认测试行为。
+
+## 两轮真实 GitHub 结果
+
+首轮 PR [80](https://github.com/kuring/ci-infra/pull/80)，原始
+[run 40500476733](https://github.com/kuring/ci-infra/actions/runs/40500476733)。
+20:01:12 找到原始 run，此后 listener 持续报告容量 3，但 inflight job `122176606268`
+保持 queued、runner_id=0；900 秒启动预算耗尽后退出 1。独立审计确认 PR 已关闭、
+精确分支已删除、run 已 completed/cancelled。该轮没有进入 drain 或节点切换阶段。
+
+对照 PR [81](https://github.com/kuring/ci-infra/pull/81)，原始
+[run 40502471146](https://github.com/kuring/ci-infra/actions/runs/40502471146) 最终 success。
+流量干预计数为：**额外启动 1 次；上游自带 resume 1 次；额外 resume 1 次**。
+
+| 北京时间 | 观测 |
+| --- | --- |
+| 20:16:36 | 显式注入一次启动流量；随后实际 runner 出现在原 worker |
+| 20:18:14 | 原始 inflight 进入等待步骤，开始 drain |
+| 20:18:24 | limits 与 advertised capacity 同时为 0 |
+| 20:18:36 | 原始 inflight 在 drain 后正常完成 |
+| 20:18:46—20:19:46 | 三个原始 held 在完整 60 秒观察窗口保持 queued、没有 runner |
+| 20:19:46 | 原 worker 加 refresh taint，记录 UID；随后启用预留 worker |
+| 20:19:47 | 原始 resume 恢复 maxRunners=3；旧节点 UID 和 taint 均保留 |
+| 20:20:04 | 上游发送一次 resume 唤醒；之后 held 及唤醒任务仍保持 queued |
+| 20:24:41 | 用户确认后额外发送一次 resume 流量；发送前保存三个原 held ID 和容量 3 的证据 |
+| 20:26:12 / 20:26:25 / 20:26:32 | 三个原始 held 的 runner、workflow Pod 均在预留 worker 上，核对后逐个释放 |
+| 20:26:44 | 四个原始任务均 success，控制器完成最终 taint 核对；随后正常退出 0 |
+
+| 原任务 | Job ID | Runner ID | 结果 |
+| --- | --- | --- | --- |
+| drain-inflight | 122183306078 | 153 | success |
+| drain-held (1) | 122184203473 | 156 | success |
+| drain-held (3) | 122184203505 | 155 | success |
+| drain-held (2) | 122184203587 | 157 | success |
+
+持续采样与最终 API 审计确认以上 job ID 没有被重跑或替换。
+旧 worker UID 为 `255ca592-211d-4a6b-8cb5-2d40dadfcece`，预留 worker UID 为
+`d90c3904-bf2a-4887-8122-3e483b2431d5`。三个 held 的 runner 和 workflow Pod
+均使用后一个 UID，各自 Pod UID 及释放前证据保存在 `final-audit.json`。
+
+## 最终状态与限制
+
+最终 maxRunners=3、advertised capacity=3，没有残留真实 runner/workflow Pod。
+原 worker 保留 `deploy.osdc.io/refresh-pending=true:NoSchedule`；预留 worker 无 refresh taint。
+本次成功后的恢复和清理没有移除原 worker 的 taint；下一次测试准备阶段才会重置。
+
+两个 PR 均关闭，两个精确测试分支均删除。对照的四个 workflow run 全部 completed：
+原始 run 与启动 wakeup success，两次 resume wakeup 在清理时 cancelled。
+本轮没有遗留后台观测进程或待执行的测试。
+
+证据位于远端 `/root/drain-reserve-20261027/evidence/` 和
+`/root/drain-reserve-wakeup-20261027/evidence/`，对应本地忽略目录
+`.state/reserve-20261027/` 与 `.state/reserve-wakeup-20261027/`。
+额外恢复流量的独立记录为 `extra-resume-pulse.json`；最终审计为 `final-audit.json`。
+
+证据归档 SHA-256：
+
+```text
+reserve-20261027:
+3f75d77cbfd64fc0dec27c2519c81a0e1a01506155d20225023f8b234c17300b
+reserve-wakeup-20261027:
+864f7e8e252b0916ecd825fd9e1bea954e16c3791486eeaa6962c6fc6282e912
+```
+
+本轮证明的是额外流量下的本地 Kind drain/resume 与真实 Pod 放置，
+没有证明原始启动或单次 resume 唤醒已经可靠，也不替代 AWS staging、Karpenter 自动供给或实际节点替换验收。
+
+---
+
+# drain-test ECS 历史验证（2026-10-20）
 
 入口：`ci-infra-test/osdc/kind/justfile`。
 上游：`ci-infra` HEAD `06c039c1de9eb7983f0b5415046a28deb28d612d`。

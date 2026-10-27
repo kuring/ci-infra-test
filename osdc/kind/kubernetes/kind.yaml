@@ -10,3 +10,8 @@ nodes:
       osdc.io/drain-kind: "true"
       node-fleet: kind-local
       workload-type: github-runner
+  - role: worker
+    labels:
+      osdc.io/drain-kind: "true"
+      node-fleet: kind-reserve
+      workload-type: kind-reserve
