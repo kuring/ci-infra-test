@@ -1,3 +1,16 @@
+# Listener / scale set 对照（2026-10-27 23:14—23:49）
+
+**两种重建都未通过完整 E2E。** 只重建 listener、保留注册 ID `25` 后，
+inflight 约 9 分 28 秒后启动，但 held 恢复超时；重新注册为 ID `26` 后，
+inflight 在 600 秒内未启动。源码和 ARS 配置保持一致，没有额外手工唤醒流量。
+
+两轮资源清理和终态审计通过，当前注册 ID `26`，limits 与 advertised capacity 均为 3。
+完整步骤、身份变化、迟到 runner、采样缺口、证据哈希及结论限制见
+[listener 会话与注册对照记录](listener-session-comparison-20261027.md)。
+本轮不能确认是 GitHub bug，也不支持仅以旧 listener 或旧注册状态残留解释全部现象。
+
+---
+
 # drain-test 当前源码复验（2026-10-27 21:57—22:32）
 
 **普通 E2E 未通过：resume 后三个 held 在 600 秒内没有完成；真实取消恢复在启动阶段超时。**
